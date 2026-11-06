@@ -34,6 +34,11 @@ namespace StorageManager {
   // Обход записей с from <= ts <= to по возрастанию времени. Источник - полный CSV на SD (если карта есть),
   // иначе буфер в ОЗУ. cb возвращает false, чтобы остановить обход. Если записей на SD слишком много для
   // полного чтения, читается выборка около `points` точек (sampled = true).
+  // Выгрузка CSV с SD в sink порциями. whole=true - файл целиком как есть; иначе заголовок + записи
+  // с from <= ts <= to. false - SD недоступна или файл не открылся.
+  typedef void (*SinkCb)(const char* data, size_t n, void* ctx);
+  bool     exportCsv(uint32_t from, uint32_t to, bool whole, SinkCb sink, void* ctx);
+
   typedef bool (*RangeCb)(const Record& r, void* ctx);
   void     forRange(uint32_t from, uint32_t to, size_t points, RangeCb cb, void* ctx,
                     bool& sampled, bool& fromSd);

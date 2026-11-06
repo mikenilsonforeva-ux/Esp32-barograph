@@ -75,7 +75,7 @@ code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:13px}
 <div class="row" style="margin-bottom:0;align-items:flex-end">
 <div style="flex:1 1 180px"><label style="margin-top:0">С</label><input type="datetime-local" id="cFrom"></div>
 <div style="flex:1 1 180px"><label style="margin-top:0">По</label><input type="datetime-local" id="cTo"></div>
-<button id="cGo" class="pri">Показать</button><button id="cAll">Весь период</button></div>
+<button id="cGo" class="pri">Показать</button><button id="cAll">Весь период</button><button id="cCsv">Скачать CSV периода</button></div>
 <div class="lbl" id="cInfo" style="margin-top:8px">--</div><div id="cmsg" class="msg"></div></div>
 <div class="row" id="metrics"></div>
 <div class="card"><div class="chartbox"><canvas id="cv"></canvas><div id="tip"></div></div><div class="stat" id="cstat"></div></div>
@@ -112,7 +112,8 @@ code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:13px}
 <div>Статус: <b id="sdSt">--</b></div><div>Файл: <b id="sdFile">barograph.csv</b></div>
 <div>Размер файла: <b id="sdSize">--</b> · Карта: <b id="sdCard">--</b></div>
 <div>История в ОЗУ: <b id="hist">--</b> · Хранилище: <b id="stor">--</b></div>
-<div class="row" style="margin-top:8px"><a href="/api/export.csv"><button>Скачать историю (CSV)</button></a></div></div>
+<div class="row" style="margin-top:8px"><button id="btnFull">Скачать полный CSV с SD</button>
+<a href="/api/export.csv"><button>Скачать буфер в памяти (72 ч)</button></a></div><div id="xmsg" class="msg"></div></div>
 
 <div class="card"><h3 style="margin-top:0">Датчик</h3><div>Тип: <b id="seType">--</b></div><div>I2C: <b id="seAddr">--</b></div><div>Состояние: <b id="seSt">--</b></div></div>
 
@@ -133,7 +134,8 @@ code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:13px}
 <h3>GET|POST <a href="/api/settings">/api/settings</a></h3><p>Параметры: ssid, password, measure_interval_s, record_interval_s (form или JSON).</p>
 <h3>GET <a href="/api/wifi/scan?start=1">/api/wifi/scan</a></h3><p>start=1 запускает сканирование, затем опрашивайте без параметра.</p>
 <h3>GET|POST <a href="/api/time">/api/time</a></h3><p>POST epoch=… — установить время (если нет NTP).</p>
-<h3>GET <a href="/api/export.csv">/api/export.csv</a></h3><p>История в CSV. Подробная документация — в README.</p>
+<h3>GET <a href="/api/export/full.csv">/api/export/full.csv</a></h3><p>Полный CSV с SD за всё время; from, to — только период (503 sd_offline, если карты нет).</p>
+<h3>GET <a href="/api/export.csv">/api/export.csv</a></h3><p>История из памяти (72 ч) в CSV. Подробная документация — в README.</p>
 </div></section>
 </main>
 
@@ -235,6 +237,12 @@ async function applyCustom(){
  else if(!j.count){m.className='msg err';m.textContent='В выбранном периоде нет измерений'}
  else{m.className='msg';m.textContent=j.sampled?'Период очень большой: показана выборка записей':''}}
 $('#cGo').onclick=applyCustom;
+function needSd(m){if(ST.sd)return true;m.className='msg err';m.textContent='SD-карта не подключена: полный CSV недоступен';return false}
+$('#btnFull').onclick=()=>{const m=$('#xmsg');m.textContent='';if(needSd(m))location.href='/api/export/full.csv'};
+$('#cCsv').onclick=()=>{const m=$('#cmsg');m.className='msg';m.textContent='';if(!needSd(m))return;
+ let a=fromLocalStr($('#cFrom').value),b=fromLocalStr($('#cTo').value);
+ if(a==null||b==null||b<=a){m.className='msg err';m.textContent='Укажите корректный период';return}
+ location.href='/api/export/full.csv?from='+a+'&to='+b};
 $('#cAll').onclick=()=>{if(!RNG||!RNG.has_data)return;$('#cFrom').value=toLocalStr(RNG.first);$('#cTo').value=toLocalStr(RNG.last);applyCustom()};
 function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
 function drawChart(hi){

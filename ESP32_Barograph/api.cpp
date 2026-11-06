@@ -526,6 +526,46 @@ void handleExport() {
   server.sendContent("");
 }
 
+// ------------------------------------------------------------------ GET /api/export/full.csv
+// Полный CSV с SD-карты (за всё время хранения). Необязательные from/to (Unix, UTC) - только этот период.
+struct ExportOut { char buf[1024]; size_t len = 0; };
+
+void exportSink(const char* d, size_t n, void* ctx) {
+  ExportOut& o = *(ExportOut*)ctx;
+  if (o.len + n > sizeof o.buf) {
+    if (o.len) { server.sendContent(o.buf, o.len); o.len = 0; }
+    if (n > sizeof o.buf) { server.sendContent(d, n); return; }
+  }
+  memcpy(o.buf + o.len, d, n);
+  o.len += n;
+}
+
+void handleExportFull() {
+  if (!StorageManager::sdOnline()) { sendError(503, "sd_offline"); return; }
+  uint32_t from = 0, to = 0xFFFFFFFEUL;
+  bool hasF = server.hasArg("from"), hasT = server.hasArg("to");
+  if (hasF && !parseU32(server.arg("from"), from)) { sendError(400, "invalid_from"); return; }
+  if (hasT && !parseU32(server.arg("to"), to))     { sendError(400, "invalid_to");   return; }
+  if (hasF && hasT && to <= from) { sendError(400, "invalid_range"); return; }
+  bool whole = !hasF && !hasT;
+
+  ExportOut* o = new (std::nothrow) ExportOut();
+  if (!o) { sendError(500, "no_memory"); return; }
+  addCors();
+  String fn = "attachment; filename=\"barograph_full.csv\"";
+  if (!whole) {
+    fn = "attachment; filename=\"barograph_" + String((unsigned long)from) + "_" +
+         (hasT ? String((unsigned long)to) : String("end")) + ".csv\"";
+  }
+  server.sendHeader("Content-Disposition", fn);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv; charset=utf-8", "");
+  StorageManager::exportCsv(from, to, whole, exportSink, o);
+  if (o->len) server.sendContent(o->buf, o->len);
+  server.sendContent("");
+  delete o;
+}
+
 void handleRoot() { server.send_P(200, "text/html; charset=utf-8", WebUi::indexHtml()); }
 
 void handleNotFound() {
@@ -550,6 +590,7 @@ void begin() {
   server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
   server.on("/api/time",     HTTP_ANY, handleTime);
   server.on("/api/export.csv", HTTP_GET, handleExport);
+  server.on("/api/export/full.csv", HTTP_GET, handleExportFull);
   server.onNotFound(handleNotFound);
   server.begin();
   LOGI("Web server started");

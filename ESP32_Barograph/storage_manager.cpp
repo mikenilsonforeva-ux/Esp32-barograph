@@ -323,6 +323,14 @@ namespace {
   const size_t SPARSE_BYTES = 2500000UL;     // больше ~2.5 МБ (около 50 тыс. записей) читаем выборкой
   const size_t SPARSE_PER_POINT = 8;         // записей подряд в каждой точке выборки
 
+  // Возвращает CSV на дозапись после чтения
+  void sdReopenAppend() {
+    csv = SD.open(SD_CSV_PATH, FILE_APPEND);
+    if (!csv) sdGoOffline("reopen after read failed");
+    unflushed = 0;
+    lastFlushMs = millis();
+  }
+
   // Читает период из CSV на SD. false - файл прочитать не удалось (тогда используется ОЗУ).
   bool sdReadRange(uint32_t from, uint32_t to, size_t points, StorageManager::RangeCb cb, void* user, bool& sampled) {
     if (csv) csv.close();                                 // данные записаны; читаем отдельным дескриптором
@@ -348,10 +356,36 @@ namespace {
       }
       f.close();
     }
-    csv = SD.open(SD_CSV_PATH, FILE_APPEND);              // возвращаем файл на дозапись
-    if (!csv) sdGoOffline("reopen after read failed");
-    unflushed = 0;
-    lastFlushMs = millis();
+    sdReopenAppend();
+    return ok;
+  }
+
+  bool sdExport(uint32_t from, uint32_t to, bool whole, StorageManager::SinkCb sink, void* user) {
+    if (csv) csv.close();
+    File f = SD.open(SD_CSV_PATH, FILE_READ);
+    bool ok = (bool)f;
+    if (ok) {
+      if (whole) {
+        uint8_t b[1024];
+        int n;
+        while ((n = f.read(b, sizeof b)) > 0) { sink((const char*)b, (size_t)n, user); esp_task_wdt_reset(); }
+      } else {
+        sink(SD_CSV_HEADER "\n", strlen(SD_CSV_HEADER) + 1, user);
+        CsvRange::Reader<File> rd(f);
+        CsvParse parse;
+        size_t off = CsvRange::findStart<File, Record, CsvParse>(rd, f.size(), from, parse);
+        uint32_t cnt = 0;
+        CsvRange::scan<File, Record, CsvParse>(rd, off, from, to, parse, [&](const Record& r) {
+          char line[96];
+          formatCsvLine(r, line, sizeof line);
+          sink(line, strlen(line), user);
+          if ((++cnt & 0xFF) == 0) esp_task_wdt_reset();
+          return true;
+        });
+      }
+      f.close();
+    }
+    sdReopenAppend();
     return ok;
   }
 }
@@ -417,6 +451,11 @@ void setRecordInterval(uint32_t seconds) {
   size_t keep = oldCnt > ringCap ? ringCap : oldCnt;
   for (size_t i = oldCnt - keep; i < oldCnt; i++) ring[ringCnt++] = old[(oldHead + i) % oldCap];
   free(old);
+}
+
+bool exportCsv(uint32_t from, uint32_t to, bool whole, SinkCb sink, void* ctx) {
+  if (!sdOk) return false;
+  return sdExport(from, to, whole, sink, ctx);
 }
 
 bool range(uint32_t& firstTs, uint32_t& lastTsOut) {
