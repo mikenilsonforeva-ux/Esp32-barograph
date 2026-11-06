@@ -71,6 +71,12 @@ code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:13px}
 
 <section id="tab-graphs" class="tab">
 <div class="row" id="periods"></div>
+<div class="card" id="cpanel" style="display:none">
+<div class="row" style="margin-bottom:0;align-items:flex-end">
+<div style="flex:1 1 180px"><label style="margin-top:0">С</label><input type="datetime-local" id="cFrom"></div>
+<div style="flex:1 1 180px"><label style="margin-top:0">По</label><input type="datetime-local" id="cTo"></div>
+<button id="cGo" class="pri">Показать</button><button id="cAll">Весь период</button></div>
+<div class="lbl" id="cInfo" style="margin-top:8px">--</div><div id="cmsg" class="msg"></div></div>
 <div class="row" id="metrics"></div>
 <div class="card"><div class="chartbox"><canvas id="cv"></canvas><div id="tip"></div></div><div class="stat" id="cstat"></div></div>
 </section>
@@ -119,6 +125,8 @@ code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:13px}
 <section id="tab-api" class="tab"><div class="card api">
 <h3>GET <a href="/api/current">/api/current</a></h3><p>Текущие значения (давление в мм рт. ст.), тренд.</p>
 <h3>GET <a href="/api/history?hours=3">/api/history?hours=3&amp;max=400</a></h3><p>История; hours — 0.5…72; max — максимум точек (downsampling).</p>
+<h3>GET <code>/api/history?from=EPOCH&amp;to=EPOCH&amp;max=400</code></h3><p>История за произвольный период (Unix-время UTC); с SD — за всё время хранения.</p>
+<h3>GET <a href="/api/range">/api/range</a></h3><p>Период, за который есть измерения (first, last).</p>
 <h3>GET|POST <a href="/api/measure">/api/measure</a></h3><p>Немедленное измерение; store=1 — добавить в историю.</p>
 <h3>GET <a href="/api/status">/api/status</a></h3><p>Состояние устройства.</p>
 <h3>GET <a href="/api/forecast">/api/forecast</a></h3><p>Тренд и прогноз.</p>
@@ -132,7 +140,7 @@ code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:13px}
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
-let TZ=10800,devDelta=null,ST={},autoTime=false,hours=1,metric='pressure',chart=null,tab='home';
+let TZ=10800,devDelta=null,ST={},autoTime=false,hours=1,metric='pressure',chart=null,tab='home',custom=null,RNG=null,GAP=0;
 const PER=[[0.5,'30 мин'],[1,'1 час'],[3,'3 часа'],[6,'6 часов'],[12,'12 часов'],[48,'48 часов'],[72,'72 часа']];
 const MET={pressure:['Давление','мм рт. ст.',2],temperature:['Температура','°C',1],humidity:['Влажность','%',1]};
 const pad=n=>String(n).padStart(2,'0');
@@ -190,11 +198,44 @@ $('#btnMeasure').onclick=async()=>{const m=$('#mres');m.textContent='...';m.clas
 
 /* ---------- графики ---------- */
 PER.forEach(p=>{const b=document.createElement('button');b.textContent=p[1];b.dataset.h=p[0];if(p[0]===hours)b.className='on';
- b.onclick=()=>{hours=p[0];[...$('#periods').children].forEach(x=>x.className=x===b?'on':'');loadChart()};$('#periods').appendChild(b)});
+ b.onclick=()=>{hours=p[0];custom=null;$('#cpanel').style.display='none';[...$('#periods').children].forEach(x=>x.className=x===b?'on':'');loadChart()};$('#periods').appendChild(b)});
+{const b=document.createElement('button');b.textContent='Свой период…';b.id='bCustom';
+ b.onclick=()=>{[...$('#periods').children].forEach(x=>x.className=x===b?'on':'');$('#cpanel').style.display='';openCustom()};$('#periods').appendChild(b)}
 Object.keys(MET).forEach(k=>{const b=document.createElement('button');b.textContent=MET[k][0];if(k===metric)b.className='on';
  b.onclick=()=>{metric=k;[...$('#metrics').children].forEach(x=>x.className=x===b?'on':'');drawChart(-1)};$('#metrics').appendChild(b)});
 let HIST=[];
-async function loadChart(){try{const j=await jget('/api/history?hours='+hours+'&max=500');HIST=j.data;drawChart(-1)}catch(e){HIST=[];drawChart(-1)}}
+async function loadChart(){try{
+  const u=custom?'/api/history?from='+custom[0]+'&to='+custom[1]+'&max=500':'/api/history?hours='+hours+'&max=500';
+  const j=await jget(u);HIST=j.data;
+  GAP=custom?Math.max(j.step_s||0,j.record_interval_s||60)*2.5:(j.record_interval_s||60)*(j.step||1)*2.5;
+  drawChart(-1);return j}catch(e){HIST=[];drawChart(-1)}}
+/* ---------- произвольный период ---------- */
+const fy=ts=>{const d=new Date((ts+TZ)*1000);return pad(d.getUTCDate())+'.'+pad(d.getUTCMonth()+1)+'.'+d.getUTCFullYear()+' '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())};
+const toLocalStr=ts=>new Date((ts+TZ)*1000).toISOString().slice(0,16);
+function fromLocalStr(v){const m=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(v);if(!m)return null;
+ return Math.floor(Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5])/1000)-TZ}
+async function openCustom(){
+ try{RNG=await jget('/api/range')}catch(e){RNG=null}
+ const i=$('#cInfo'),f=$('#cFrom'),t=$('#cTo');
+ if(!RNG||!RNG.has_data){i.textContent='Измерений пока нет';return}
+ f.min=t.min=toLocalStr(RNG.first);f.max=t.max=toLocalStr(RNG.last+60);
+ i.textContent='Измерения есть с '+fy(RNG.first)+' по '+fy(RNG.last)+(RNG.source==='sd'?' (SD)':' (память устройства)');
+ if(!f.value||!t.value){const e=RNG.last,b=Math.max(RNG.first,e-86400);f.value=toLocalStr(b);t.value=toLocalStr(e)}
+ if(!custom)applyCustom()}
+async function applyCustom(){
+ const m=$('#cmsg');m.className='msg';m.textContent='';
+ let a=fromLocalStr($('#cFrom').value),b=fromLocalStr($('#cTo').value);
+ if(a==null||b==null){m.className='msg err';m.textContent='Укажите начало и конец периода';return}
+ if(b<=a){m.className='msg err';m.textContent='Конец периода должен быть позже начала';return}
+ if(RNG&&RNG.has_data){a=Math.max(a,RNG.first);b=Math.min(b,RNG.last);
+  if(a>=b){m.className='msg err';m.textContent='В выбранном периоде нет измерений';return}}
+ custom=[a,b];m.textContent='Загрузка…';
+ const j=await loadChart();
+ if(!j)m.className='msg err',m.textContent='Не удалось загрузить данные';
+ else if(!j.count){m.className='msg err';m.textContent='В выбранном периоде нет измерений'}
+ else{m.className='msg';m.textContent=j.sampled?'Период очень большой: показана выборка записей':''}}
+$('#cGo').onclick=applyCustom;
+$('#cAll').onclick=()=>{if(!RNG||!RNG.has_data)return;$('#cFrom').value=toLocalStr(RNG.first);$('#cTo').value=toLocalStr(RNG.last);applyCustom()};
 function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
 function drawChart(hi){
  const cv=$('#cv'),dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
@@ -208,9 +249,9 @@ function drawChart(hi){
  const X=t=>L+(t-t0)/ts*pw,Y=v=>T+(1-(v-mn)/(mx-mn))*ph;
  g.strokeStyle=gr;g.fillStyle=fg;g.lineWidth=1;g.textAlign='right';
  for(let i=0;i<=4;i++){const v=mn+(mx-mn)*i/4,y=Y(v);g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();g.fillText(v.toFixed(m[2]>1?1:1),L-5,y+4)}
- g.textAlign='center';const wd=ts>86400;
- for(let i=0;i<=4;i++){const t=t0+ts*i/4,x=X(t);g.beginPath();g.moveTo(x,T);g.lineTo(x,T+ph);g.stroke();g.fillText(fmt(t,wd||hours>=24),Math.min(Math.max(x,L+22),W-R-22),H-6)}
- g.strokeStyle=ac;g.lineWidth=2;g.beginPath();pts.forEach((p,i)=>{const x=X(p.timestamp),y=Y(p[metric]);i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();
+ g.textAlign='center';const wd=ts>86400||(custom?Math.floor((t0+TZ)/86400)!==Math.floor((t1+TZ)/86400):hours>=24);
+ for(let i=0;i<=4;i++){const t=t0+ts*i/4,x=X(t);g.beginPath();g.moveTo(x,T);g.lineTo(x,T+ph);g.stroke();g.fillText(fmt(t,wd),Math.min(Math.max(x,L+22),W-R-22),H-6)}
+ g.strokeStyle=ac;g.lineWidth=2;g.beginPath();pts.forEach((p,i)=>{const x=X(p.timestamp),y=Y(p[metric]);(i&&(!GAP||p.timestamp-pts[i-1].timestamp<=GAP))?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();
  chart={pts,X,Y,L,R,T,ph,W};
  if(hi>=0){const p=pts[hi],x=X(p.timestamp),y=Y(p[metric]);g.strokeStyle=fg;g.lineWidth=1;g.beginPath();g.moveTo(x,T);g.lineTo(x,T+ph);g.stroke();g.fillStyle=ac;g.beginPath();g.arc(x,y,4,0,7);g.fill()}
  const first=pts[0][metric],last=pts[pts.length-1][metric],d=last-first;
@@ -273,8 +314,8 @@ function show(t){tab=t;document.querySelectorAll('.tab').forEach(e=>e.className=
  document.querySelectorAll('#nav button').forEach(b=>b.className=b.dataset.tab===t?'on':'');
  if(t==='graphs')loadChart();if(t==='fc')loadForecast();if(t==='set'){loadSettings();fillStatus()}}
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>show(b.dataset.tab));
-function poll(){refreshCurrent();if(tab==='fc')loadForecast();if(tab==='graphs')loadChart()}
-refreshStatus();refreshCurrent();setInterval(refreshCurrent,3000);setInterval(refreshStatus,5000);setInterval(()=>{if(tab==='fc')loadForecast();if(tab==='graphs')loadChart()},30000);
+function poll(){refreshCurrent();if(tab==='fc')loadForecast();if(tab==='graphs'&&!custom)loadChart()}
+refreshStatus();refreshCurrent();setInterval(refreshCurrent,3000);setInterval(refreshStatus,5000);setInterval(()=>{if(tab==='fc')loadForecast();if(tab==='graphs'&&!custom)loadChart()},30000);
 </script></body></html>)rawliteral";
 
 namespace WebUi {

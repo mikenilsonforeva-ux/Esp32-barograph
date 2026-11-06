@@ -11,6 +11,7 @@
 #include "web_ui.h"
 #include <WebServer.h>
 #include <WiFi.h>
+#include <new>
 
 namespace {
 
@@ -123,7 +124,117 @@ void handleCurrent() {
 }
 
 // ------------------------------------------------------------------ GET /api/history
+// ---- произвольный период: /api/history?from=EPOCH&to=EPOCH ----
+struct RangeAgg {
+  uint32_t from = 0, step = 1;      // начало периода и ширина интервала усреднения, с
+  uint32_t cur = 0xFFFFFFFFUL;      // номер текущего интервала
+  double sts = 0, sp = 0, st = 0, sh = 0;
+  uint32_t c = 0, ch = 0;
+  size_t raw = 0, out = 0;
+  char buf[1024];
+  int len = 0;
+};
+
+void aggFlush(RangeAgg& a) {
+  if (a.c == 0) return;
+  if (a.len > (int)sizeof(a.buf) - 140) { server.sendContent(a.buf, a.len); a.len = 0; }
+  a.len += snprintf(a.buf + a.len, sizeof(a.buf) - a.len,
+                    "%s{\"timestamp\":%lu,\"pressure\":%.2f,\"temperature\":%.1f,\"humidity\":",
+                    a.out ? "," : "", (unsigned long)(a.sts / a.c + 0.5), a.sp / a.c, a.st / a.c);
+  if (a.ch) a.len += snprintf(a.buf + a.len, sizeof(a.buf) - a.len, "%.1f}", a.sh / a.ch);
+  else      a.len += snprintf(a.buf + a.len, sizeof(a.buf) - a.len, "null}");
+  a.out++;
+  a.sts = a.sp = a.st = a.sh = 0;
+  a.c = a.ch = 0;
+}
+
+bool aggAdd(const Record& r, void* ctx) {
+  RangeAgg& a = *(RangeAgg*)ctx;
+  uint32_t idx = (r.ts - a.from) / a.step;
+  if (idx != a.cur) { aggFlush(a); a.cur = idx; }
+  a.sts += r.ts; a.sp += recPressureMmHg(r); a.st += recTempC(r); a.c++;
+  if (recHumValid(r)) { a.sh += recHum(r); a.ch++; }
+  a.raw++;
+  return true;
+}
+
+// строгий разбор целого числа без знака; false - пустая строка или мусор
+bool parseU32(const String& s, uint32_t& out) {
+  if (s.length() == 0) return false;
+  for (size_t i = 0; i < s.length(); i++) if (s[i] < '0' || s[i] > '9') return false;
+  unsigned long long v = strtoull(s.c_str(), nullptr, 10);
+  if (v > 0xFFFFFFFEULL) return false;
+  out = (uint32_t)v;
+  return true;
+}
+
+void handleHistoryRange(int maxPts) {
+  static const char EMPTY[] = "{\"from\":null,\"to\":null,\"step_s\":0,\"source\":\"ram\",\"sampled\":false,\"raw_count\":0,\"count\":0,\"data\":[]}";
+  uint32_t first, last;
+  bool has = StorageManager::range(first, last);
+  uint32_t from = has ? first : 0, to = has ? last : 0;
+  if (server.hasArg("from") && !parseU32(server.arg("from"), from)) { sendError(400, "invalid_from"); return; }
+  if (server.hasArg("to")   && !parseU32(server.arg("to"), to))     { sendError(400, "invalid_to");   return; }
+  if (server.hasArg("from") && server.hasArg("to") && to <= from) { sendError(400, "invalid_range"); return; }
+  if (has) {                                                        // период ограничиваем данными, которые есть
+    if (from < first) from = first;
+    if (to > last) to = last;
+  }
+  if (!has || from > to) {                                          // в запрошенном периоде измерений нет
+    addCors();
+    server.send(200, "application/json; charset=utf-8", EMPTY);
+    return;
+  }
+
+  RangeAgg* a = new (std::nothrow) RangeAgg();
+  if (!a) { sendError(500, "no_memory"); return; }
+  a->from = from;
+  uint32_t span = to - from + 1;
+  a->step = (span + (uint32_t)maxPts - 1) / (uint32_t)maxPts;
+  if (a->step < 1) a->step = 1;
+
+  addCors();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json; charset=utf-8", "");
+  a->len = snprintf(a->buf, sizeof a->buf,
+      "{\"from\":%lu,\"to\":%lu,\"step_s\":%lu,\"record_interval_s\":%lu,\"data\":[",
+      (unsigned long)from, (unsigned long)to, (unsigned long)a->step, (unsigned long)Settings::get().recordIntervalS);
+
+  bool sampled = false, fromSd = false;
+  StorageManager::forRange(from, to, (size_t)maxPts, aggAdd, a, sampled, fromSd);
+  aggFlush(*a);
+
+  a->len += snprintf(a->buf + a->len, sizeof(a->buf) - a->len,
+      "],\"source\":\"%s\",\"sampled\":%s,\"raw_count\":%u,\"count\":%u}",
+      fromSd ? "sd" : "ram", sampled ? "true" : "false", (unsigned)a->raw, (unsigned)a->out);
+  server.sendContent(a->buf, a->len);
+  server.sendContent("");
+  delete a;
+}
+
+// ------------------------------------------------------------------ GET /api/range
+// Период, за который есть измерения: границы допустимых значений для from/to в /api/history
+void handleRange() {
+  uint32_t first, last;
+  bool ok = StorageManager::range(first, last);
+  String j = "{\"has_data\":";
+  j += ok ? "true" : "false";
+  j += ",\"first\":";      if (ok) j += first; else j += "null";
+  j += ",\"first_iso\":";  putIso(j, ok ? first : 0);
+  j += ",\"last\":";       if (ok) j += last; else j += "null";
+  j += ",\"last_iso\":";   putIso(j, ok ? last : 0);
+  j += ",\"source\":\"";    j += StorageManager::sdOnline() ? "sd" : "ram"; j += "\"}";
+  sendJson(200, j);
+}
+
 void handleHistory() {
+  if (server.hasArg("from") || server.hasArg("to")) {               // произвольный период
+    int mp = server.hasArg("max") ? server.arg("max").toInt() : HISTORY_DEFAULT_POINTS;
+    if (mp < 10) mp = 10;
+    if (mp > HISTORY_MAX_POINTS) mp = HISTORY_MAX_POINTS;
+    handleHistoryRange(mp);
+    return;
+  }
   float hours = server.hasArg("hours") ? server.arg("hours").toFloat() : 1.0f;
   if (!(hours > 0.0f)) hours = 1.0f;
   if (hours > (float)HISTORY_HOURS) hours = (float)HISTORY_HOURS;
@@ -431,6 +542,7 @@ void begin() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/current",  HTTP_GET, handleCurrent);
   server.on("/api/history",  HTTP_GET, handleHistory);
+  server.on("/api/range",    HTTP_GET, handleRange);
   server.on("/api/measure",  HTTP_ANY, handleMeasure);
   server.on("/api/status",   HTTP_GET, handleStatus);
   server.on("/api/forecast", HTTP_GET, handleForecast);

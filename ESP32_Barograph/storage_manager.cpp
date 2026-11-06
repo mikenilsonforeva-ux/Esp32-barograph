@@ -1,6 +1,7 @@
 // storage_manager.cpp
 #include "storage_manager.h"
 #include "time_manager.h"
+#include "csv_range.h"
 #include <SD.h>
 #include <SPI.h>
 #include <LittleFS.h>
@@ -23,6 +24,7 @@ namespace {
   bool     sdSpiStarted = false;
   File     csv;
   uint32_t csvLastTsOnCard = 0;
+  uint32_t csvFirstTs = 0;          // метка времени первой записи в CSV (0 - файл пуст)
   uint32_t lastHealthMs = 0, lastSdTryMs = 0, lastFlushMs = 0;
   uint16_t unflushed = 0;
 
@@ -201,6 +203,18 @@ namespace {
     return last;
   }
 
+  uint32_t csvReadFirstTs() {
+    File f = SD.open(SD_CSV_PATH, FILE_READ);
+    if (!f) return 0;
+    char line[96];
+    uint32_t first = 0;
+    Record r;
+    for (int i = 0; i < 4 && readLine(f, line, sizeof line); i++)      // заголовок + пара строк
+      if (parseCsvLine(line, r)) { first = r.ts; break; }
+    f.close();
+    return first;
+  }
+
   // Загрузка хвоста CSV в кольцевой буфер
   void ringLoadFromCsv() {
     File f = SD.open(SD_CSV_PATH, FILE_READ);
@@ -227,6 +241,7 @@ namespace {
     formatCsvLine(r, line, sizeof line);
     size_t len = strlen(line);
     if (csv.write((const uint8_t*)line, len) != len) return false;
+    if (csvFirstTs == 0) csvFirstTs = r.ts;
     unflushed++;
     if (unflushed >= SD_FLUSH_EVERY_N) { csv.flush(); unflushed = 0; lastFlushMs = millis(); }
     return true;
@@ -255,6 +270,7 @@ namespace {
     if (!SD.exists(SD_CSV_DIR) && !SD.mkdir(SD_CSV_DIR)) { LOGE("SD: mkdir failed"); SD.end(); return false; }
     csvRepairTail();
     csvLastTsOnCard = csvReadLastTs();
+    csvFirstTs = csvReadFirstTs();
     return true;
   }
 
@@ -292,6 +308,51 @@ namespace {
     LittleFS.remove(FLASH_HISTORY_PATH);
     flashCnt = 0;
     LOGI("Flash -> SD sync done: moved %u, skipped %u", (unsigned)moved, (unsigned)skipped);
+  }
+
+  // ======================= Чтение периода =======================
+  struct CsvParse {
+    bool operator()(const char* line, Record& r) const { return parseCsvLine(line, r); }
+  };
+  struct RangeCtx {
+    StorageManager::RangeCb cb;
+    void* user;
+    uint32_t n;
+  };
+
+  const size_t SPARSE_BYTES = 2500000UL;     // больше ~2.5 МБ (около 50 тыс. записей) читаем выборкой
+  const size_t SPARSE_PER_POINT = 8;         // записей подряд в каждой точке выборки
+
+  // Читает период из CSV на SD. false - файл прочитать не удалось (тогда используется ОЗУ).
+  bool sdReadRange(uint32_t from, uint32_t to, size_t points, StorageManager::RangeCb cb, void* user, bool& sampled) {
+    if (csv) csv.close();                                 // данные записаны; читаем отдельным дескриптором
+    File f = SD.open(SD_CSV_PATH, FILE_READ);
+    bool ok = (bool)f;
+    if (ok) {
+      CsvRange::Reader<File> rd(f);
+      size_t size = f.size();
+      CsvParse parse;
+      RangeCtx ctx = {cb, user, 0};
+      auto each = [&ctx](const Record& r) {
+        if ((++ctx.n & 0xFF) == 0) esp_task_wdt_reset();
+        return ctx.cb(r, ctx.user);
+      };
+      size_t offFrom = CsvRange::findStart<File, Record, CsvParse>(rd, size, from, parse);
+      size_t offTo   = CsvRange::findStart<File, Record, CsvParse>(rd, size, to == UINT32_MAX ? to : to + 1, parse);
+      if (offTo > offFrom && offTo - offFrom > SPARSE_BYTES) {
+        sampled = true;
+        auto tick = [&ctx](const Record& r) { esp_task_wdt_reset(); return ctx.cb(r, ctx.user); };
+        CsvRange::sample<File, Record, CsvParse>(rd, offFrom, offTo, from, to, points, SPARSE_PER_POINT, parse, tick);
+      } else {
+        CsvRange::scan<File, Record, CsvParse>(rd, offFrom, from, to, parse, each);
+      }
+      f.close();
+    }
+    csv = SD.open(SD_CSV_PATH, FILE_APPEND);              // возвращаем файл на дозапись
+    if (!csv) sdGoOffline("reopen after read failed");
+    unflushed = 0;
+    lastFlushMs = millis();
+    return ok;
   }
 }
 
@@ -356,6 +417,28 @@ void setRecordInterval(uint32_t seconds) {
   size_t keep = oldCnt > ringCap ? ringCap : oldCnt;
   for (size_t i = oldCnt - keep; i < oldCnt; i++) ring[ringCnt++] = old[(oldHead + i) % oldCap];
   free(old);
+}
+
+bool range(uint32_t& firstTs, uint32_t& lastTsOut) {
+  firstTs = 0;
+  lastTsOut = lastTs;
+  if (sdOk && csvFirstTs) firstTs = csvFirstTs;
+  else if (ringCnt) firstTs = ring[ringHead].ts;
+  return firstTs != 0 && lastTs >= firstTs;
+}
+
+void forRange(uint32_t from, uint32_t to, size_t points, RangeCb cb, void* ctx, bool& sampled, bool& fromSd) {
+  sampled = false;
+  fromSd = false;
+  if (sdOk && csvFirstTs) {
+    if (sdReadRange(from, to, points, cb, ctx, sampled)) { fromSd = true; return; }
+  }
+  for (size_t i = 0; i < ringCnt; i++) {                   // ОЗУ: записи отсортированы по времени
+    const Record& r = ring[(ringHead + i) % ringCap];
+    if (r.ts < from) continue;
+    if (r.ts > to) break;
+    if (!cb(r, ctx)) break;
+  }
 }
 
 size_t   count()         { return ringCnt; }

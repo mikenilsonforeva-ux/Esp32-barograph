@@ -28,6 +28,16 @@ namespace StorageManager {
   bool   get(size_t index, Record& out);         // 0 = самая старая
   uint32_t lastTimestamp();
 
+  // Период, за который есть измерения (первая и последняя метка времени). false - данных нет.
+  bool     range(uint32_t& firstTs, uint32_t& lastTs);
+
+  // Обход записей с from <= ts <= to по возрастанию времени. Источник - полный CSV на SD (если карта есть),
+  // иначе буфер в ОЗУ. cb возвращает false, чтобы остановить обход. Если записей на SD слишком много для
+  // полного чтения, читается выборка около `points` точек (sampled = true).
+  typedef bool (*RangeCb)(const Record& r, void* ctx);
+  void     forRange(uint32_t from, uint32_t to, size_t points, RangeCb cb, void* ctx,
+                    bool& sampled, bool& fromSd);
+
   bool        sdOnline();
   const char* backend();                         // "sd" или "flash"
   uint64_t    sdCardBytes();

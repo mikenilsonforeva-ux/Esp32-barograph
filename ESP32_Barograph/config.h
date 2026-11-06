@@ -6,7 +6,7 @@
 #include <Arduino.h>
 
 #define FW_NAME     "ESP32 BAROGRAPH"
-#define FW_VERSION  "1.0.0"
+#define FW_VERSION  "1.1.0"
 
 // ---- Логирование в Serial --------------------------------------------------
 #define LOGI(fmt, ...)  Serial.printf(fmt "\n", ##__VA_ARGS__)
